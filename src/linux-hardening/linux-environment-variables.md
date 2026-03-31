@@ -79,6 +79,19 @@ Change the **value of this variable to 0**, so when you **end your session** any
 
 ```bash
 export HISTSIZE=0
+
+```
+### **HISTCONTROL**
+
+If the **value of this variable is set to ignorespace or ignoreboth** any command prepend it with an extra space will not be saved in the history.
+
+```bash
+export HISTCONTROL=ignorespace
+```
+
+```bash
+$ echo "to save or"
+$  echo "not to save"
 ```
 
 ### http_proxy & https_proxy
@@ -89,6 +102,18 @@ The processes will use the **proxy** declared here to connect to internet throug
 export http_proxy="http://10.10.10.10:8080"
 export https_proxy="http://10.10.10.10:8080"
 ```
+
+### all_proxy & no_proxy
+
+- `all_proxy`: default proxy for tools/protocols that honor it.
+- `no_proxy`: bypass list (hosts/domains/CIDRs) that should connect directly.
+
+```bash
+export all_proxy="socks5h://10.10.10.10:1080"
+export no_proxy="localhost,127.0.0.1,.corp.local,10.0.0.0/8"
+```
+
+Both lowercase and uppercase variants may be used depending on the tool (`http_proxy`/`HTTP_PROXY`, `no_proxy`/`NO_PROXY`).
 
 ### SSL_CERT_FILE & SSL_CERT_DIR
 
@@ -122,6 +147,5 @@ One background job, one stopped and last command didn't finish correctly:
 ![](<../images/image (715).png>)
 
 {{#include ../banners/hacktricks-training.md}}
-
 
 
